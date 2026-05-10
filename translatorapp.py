@@ -1,5 +1,4 @@
-from deep_translator import GoogleTranslator
+import speech_recognition 
+import pyttsx
 
-# Simple usage
-translated = GoogleTranslator(source='auto', target='b').translate("Hello World")
-print(translated)
+
