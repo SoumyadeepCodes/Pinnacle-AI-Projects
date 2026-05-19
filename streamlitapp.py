@@ -94,10 +94,11 @@ with left_col:
 
 # --- Streamlit Session Execution Logic ---
 if record_clicked:
-    st.session_state.status = "Initializing microphone hardware..."
+    st.session_state.status = "Initializing audio pipeline..."
     status_placeholder = st.empty()
     status_placeholder.markdown(f'<div class="status-box"><b>Status:</b> {st.session_state.status}</div>', unsafe_allow_html=True)
     
+    # 1. Clear the queue to prevent stale data poisoning from previous runs
     while not audio_queue.empty():
         try: audio_queue.get_nowait()
         except queue.Empty: break
@@ -107,72 +108,82 @@ if record_clicked:
     frames_per_chunk = int(sr * chunk_duration)
     recorded_chunks = []
     
-    ambient_energies = []
-    with sd.InputStream(samplerate=sr, channels=1, callback=audio_callback, blocksize=int(sr * 0.2), dtype='float32'):
-        time.sleep(0.4)
-        while not audio_queue.empty():
-            chunk = audio_queue.get()
-            ambient_energies.append(np.sqrt(np.mean(chunk**2)))
-            
-    silence_threshold = max(np.mean(ambient_energies) * 2.5, 0.004) if ambient_energies else 0.015
-
-    st.session_state.status = "?? Speak now! The engine is tracking speech active patterns..."
+    st.session_state.status = "🔴 Recording in progress... Speak clearly now!"
     status_placeholder.markdown(f'<div class="status-box"><b>Status:</b> {st.session_state.status}</div>', unsafe_allow_html=True)
     
-    speech_detected = False
-    silent_chunks_count = 0
-    max_silence_chunks = int(1.2 / chunk_duration)
     start_time = time.time()
+    speech_detected = False
+    silent_chunks = 0
+    max_silence_chunks = int(1.5 / chunk_duration) # 1.5 seconds of silence cuts it off
     
-    with sd.InputStream(samplerate=sr, channels=1, callback=audio_callback, blocksize=frames_per_chunk, dtype='float32'):
-        while (time.time() - start_time) < recording_duration:
-            try:
-                chunk = audio_queue.get(timeout=0.4)
-                recorded_chunks.append(chunk)
-                rms = np.sqrt(np.mean(chunk**2))
-                
-                if rms > silence_threshold:
-                    speech_detected = True
-                    silent_chunks_count = 0
-                else:
-                    if speech_detected:
-                        silent_chunks_count += 1
+    try:
+        # 2. Single, continuous stream to prevent Windows driver race conditions
+        with sd.InputStream(samplerate=sr, channels=1, callback=audio_callback, blocksize=frames_per_chunk, dtype='float32'):
+            while (time.time() - start_time) < recording_duration:
+                try:
+                    chunk = audio_queue.get(timeout=0.5)
+                    
+                    # 3. Digital Gain Multiplier (Crucial for weak hardware mics)
+                    boosted_chunk = chunk * 2.5 
+                    recorded_chunks.append(boosted_chunk)
+                    
+                    rms = np.sqrt(np.mean(boosted_chunk**2))
+                    
+                    # 4. Brutally simple absolute thresholding
+                    if rms > 0.015: 
+                        speech_detected = True
+                        silent_chunks = 0
+                    else:
+                        if speech_detected:
+                            silent_chunks += 1
+                            
+                    if speech_detected and silent_chunks >= max_silence_chunks:
+                        st.session_state.status = "⏸️ Speech cadence pause caught. Running translation..."
+                        break
                         
-                if speech_detected and silent_chunks_count >= max_silence_chunks:
-                    st.session_state.status = "?? Speech cadence pause caught. Running translation..."
-                    break
-            except queue.Empty:
-                continue
-                
-        if not speech_detected and (time.time() - start_time) >= recording_duration:
-            st.session_state.status = "?? Session timeout. No clear audio patterns registered."
+                except queue.Empty:
+                    continue
+                    
+    except Exception as e:
+        st.error(f"Hardware Input Failure. Ensure your microphone is not being used by another app. Error: {e}")
+            
+    if not speech_detected and (time.time() - start_time) >= recording_duration:
+        st.session_state.status = "⚠️ Session timeout. Volume too low or no audio detected."
 
     status_placeholder.markdown(f'<div class="status-box"><b>Status:</b> {st.session_state.status}</div>', unsafe_allow_html=True)
 
-    if speech_detected and len(recorded_chunks) > 0:
+    if len(recorded_chunks) > 0:
         raw_audio = np.concatenate(recorded_chunks).flatten()
         max_val = np.max(np.abs(raw_audio))
-        if max_val > 0:
+        
+        if max_val > 0.001: # Ensure we aren't processing pure silence
+            # Normalize audio
             audio_signal = raw_audio / max_val
-            result = model.transcribe(audio_signal, fp16=False, language="en")
-            st.session_state.transcription = result["text"].strip()
             
-            if st.session_state.transcription and "thank you" not in st.session_state.transcription.lower()[:10]:
+            with st.spinner("Whisper engine decoding..."):
+                result = model.transcribe(audio_signal, fp16=False, language="en")
+                st.session_state.transcription = result["text"].strip()
+            
+            # Filter out known Whisper silence hallucinations
+            bad_phrases = ["thank you", "thanks for watching", "subtitles by"]
+            is_hallucination = any(phrase in st.session_state.transcription.lower() for phrase in bad_phrases)
+            
+            if st.session_state.transcription and not is_hallucination:
                 try:
-                    translator = GoogleTranslator(source='en', target=selected_lang_data["code"])
-                    st.session_state.translation = translator.translate(st.session_state.transcription)
-                    st.session_state.status = "? Process completely generated."
+                    with st.spinner("Translating..."):
+                        translator = GoogleTranslator(source='en', target=selected_lang_data["code"])
+                        st.session_state.translation = translator.translate(st.session_state.transcription)
+                        st.session_state.status = "✅ Process completely generated."
                 except Exception as ex:
                     st.session_state.translation = "Translation network failure."
-                    st.session_state.status = f"? Error: {ex}"
+                    st.session_state.status = f"❌ Error: {ex}"
             else:
-                st.session_state.transcription = "[Empty or unreadable audio]"
+                st.session_state.transcription = "[Audio rejected: Insufficient clarity or silence hallucination]"
                 st.session_state.translation = ""
         else:
-            st.session_state.status = "? Hardware signal zero value error."
+            st.session_state.status = "❌ Hardware signal zero value error. Mic is dead."
             
     status_placeholder.markdown(f'<div class="status-box"><b>Status:</b> {st.session_state.status}</div>', unsafe_allow_html=True)
-
 # --- Display Layout Results Panel ---
 with right_col:
     st.subheader("Output Interface")
@@ -182,10 +193,14 @@ with right_col:
     if st.session_state.translation:
         try:
             with st.spinner("Synthesizing fluent audio channels..."):
-                tts = gTTS(text=st.session_state.translation, lang=selected_lang_data["code"].split('-'))
+                # 1. First Principle Data Typing: Pass the raw string. Do not split it.
+                tts = gTTS(text=st.session_state.translation, lang=selected_lang_data["code"])
                 fp = io.BytesIO()
                 tts.write_to_fp(fp)
                 fp.seek(0)
-                st.audio(fp, format="audio/mp3")
+                
+                # 2. Zero-Friction Execution: Force browser autoplay
+                st.audio(fp, format="audio/mp3", autoplay=True)
+                
         except Exception as e:
             st.error(f"Voice generation failed: {e}")
